@@ -1,4 +1,4 @@
-# MGLIQA
+# MGL-IQA
 
  code for paper "Meta-learning Enhanced Global-Local Feature Fusion for Image Quality Assessment" 
 
