@@ -2,7 +2,7 @@
 
  code for paper "Meta-learning Enhanced Global-Local Feature Fusion for Image Quality Assessment" 
 
-![Framework](images/framework.png)
+![Framework](images/framework.jpg)
  
 
  ## Dependencies
@@ -11,7 +11,9 @@
 
 
 ## Code
-- [ ] Ongoing
+- [X] Meta-Training
+- [X] Finetune
+- [ ] optimizing
 
 
 ## Acknowledgement
