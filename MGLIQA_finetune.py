@@ -45,6 +45,7 @@ class ImageRatingsDataset(Dataset):
         image = np.asarray(im)
         rating = self.images_frame.iloc[idx, 1]
         sample = {'image': image, 'rating': rating}
+
         if self.transform:
             sample = self.transform(sample)
         return sample
@@ -88,6 +89,7 @@ class RandomCrop(object):
         image, rating = sample['image'], sample['rating']
         h, w = image.shape[:2]
         new_h, new_w = self.output_size
+
         top = np.random.randint(0, h - new_h)
         left = np.random.randint(0, w - new_w)
 
@@ -98,7 +100,6 @@ class RandomCrop(object):
 
 
 class RandomHorizontalFlip(object):
-
     def __init__(self, p):
         self.p = p
 
@@ -110,7 +111,6 @@ class RandomHorizontalFlip(object):
 
 
 class RandomVerticalFlip(object):
-
     def __init__(self, p):
         self.p = p
 
@@ -122,7 +122,6 @@ class RandomVerticalFlip(object):
 
 
 class Normalize(object):
-
     def __init__(self):
         self.means = np.array([0.485, 0.456, 0.406])
         self.stds = np.array([0.229, 0.224, 0.225])
@@ -141,14 +140,12 @@ class ToTensor(object):
 
     def __call__(self, sample):
         image, rating = sample['image'], sample['rating']
-
         image = image.transpose((2, 0, 1))
         return {'image': torch.from_numpy(image).double(),
                 'rating': torch.from_numpy(np.float64([rating])).double()}
 
 
 class BaselineModel1(nn.Module):
-
     def __init__(self, num_classes, keep_probability, inputsize):
         super(BaselineModel1, self).__init__()
         self.fc1 = nn.Linear(inputsize, 1024)
@@ -159,7 +156,6 @@ class BaselineModel1(nn.Module):
         out = self.fc1(x)
         out = self.fc2(out)
         out = self.fc3(out)
-
         return out
 
 
@@ -195,6 +191,7 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
+        # FIXME look at relaxing size constraints
         assert H == self.img_size[0] and W == self.img_size[1], \
             f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
         x = self.proj(x).flatten(2).transpose(1, 2)
@@ -206,6 +203,7 @@ class CrossAttention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
+        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
         self.scale = qk_scale or head_dim ** -0.5
 
         self.wq = nn.Linear(dim, dim, bias=qkv_bias)
@@ -242,7 +240,6 @@ class CrossAttentionBlock(nn.Module):
         self.norm1 = norm_layer(dim)
         self.attn = CrossAttention(
             dim, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop)
-        # NOTE: drop path for stochastic depth, we shall see if this is better than dropout here
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.has_mlp = has_mlp
         if has_mlp:
@@ -266,7 +263,6 @@ class MultiScaleBlock(nn.Module):
 
         num_branches = len(dim)
         self.num_branches = num_branches
-        # different branch could have different embedding size, the first one is the base
         self.blocks = nn.ModuleList()
         for d in range(num_branches):
             tmp = []
@@ -319,9 +315,7 @@ class MultiScaleBlock(nn.Module):
 
     def forward(self, x):
         outs_b = [block(x_) for x_, block in zip(x, self.blocks)]
-        # only take the cls token out
         proj_cls_token = [proj(x[:, 0:1]) for x, proj in zip(outs_b, self.projs)]
-        # cross attention
         outs = []
         for i in range(self.num_branches):
             tmp = torch.cat((proj_cls_token[i], outs_b[(i + 1) % self.num_branches][:, 1:, ...]), dim=1)
@@ -435,7 +429,7 @@ class VisionTransformer(nn.Module):
                                                                                                                   self.img_size[
                                                                                                                       i] else x
             tmp = self.patch_embed[i](x_)
-            cls_tokens = self.cls_token[i].expand(B, -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+            cls_tokens = self.cls_token[i].expand(B, -1, -1)
             tmp = torch.cat((cls_tokens, tmp), dim=1)
             tmp = tmp + self.pos_embed[i]
             tmp = self.pos_drop(tmp)
@@ -519,8 +513,6 @@ class Net(nn.Module):
         x = self.net(x12)
         return x
 
-
-
 def computeSpearman(dataloader_valid, model):
     ratings = []
     predictions = []
@@ -530,7 +522,6 @@ def computeSpearman(dataloader_valid, model):
             inputs = data['image']
             batch_size = inputs.size()[0]
             labels = data['rating'].view(batch_size, -1)
-            # labels = labels / 100.0
             if use_gpu:
                 try:
                     inputs, labels = Variable(inputs.float().cuda()), Variable(labels.float().cuda())
@@ -547,122 +538,57 @@ def computeSpearman(dataloader_valid, model):
     predictions_i = np.vstack([p.cpu().numpy() for p in predictions])
     a = ratings_i[:, 0]
     b = predictions_i[:, 0]
-    sp = spearmanr(a, b)
-    return sp
+    sp = spearmanr(a, b)[0]
+    pl = pearsonr(a, b)[0]
+    return sp, pl
 
 
-def train_model():
-    epochs = 20
-    task_num = 5
-    noise_num1 = 24
-    noise_num2 = 25
+def finetune_model():
+    epochs = 50
+    srocc_l = []
+    best_srocc = 0
+    print('=============Saving Finetuned Prior Model===========')
+    data_dir = os.path.join('LIVE_WILD')
+    images = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_score.csv'), sep=',')
+    images_fold = "LIVE_WILD/"
+    if not os.path.exists(images_fold):
+        os.makedirs(images_fold)
 
-    net1 = EfficientNet.from_name('efficientnet-b4')
-    net2 = crossvit_18_dagger_384(pretrained=True)
-    net = BaselineModel1(1, 0.5, 4792)
-    model = Net(net1=net1,net2=net2,net=net)
-    criterion = nn.MSELoss()
-    ignored_params = list(map(id, model.net.parameters()))
-    base_params = filter(lambda p: id(p) not in ignored_params,
-                         model.parameters())
-    optimizer = optim.Adam([
-        {'params': base_params},
-        {'params': model.net.parameters(), 'lr': 1e-4}
-    ], lr=1e-2)
-    model.cuda()
+    for i in range(1, 10):
+        images_train, images_test = train_test_split(images, train_size=0.8)
+        net1 = crossvit_18_dagger_384(pretrained=False)
+        net2 = BaselineModel1(1, 0.5, 3000)
+        model = Net(net1=net1, net2=net2)
+        train_path = images_fold + "train_image" + ".csv"
+        test_path = images_fold + "test_image" + ".csv"
+        images_train.to_csv(train_path, sep=',', index=False)
+        images_test.to_csv(test_path, sep=',', index=False)
+        model.load_state_dict(torch.load('models/mgliqa.pt'))
 
-    meta_model = copy.deepcopy(model)
-    temp_model = copy.deepcopy(model)
+        for m in model.modules():
+            if 'Conv' in str(type(m)):
+                setattr(m, 'padding_mode', 'zeros')
+        criterion = nn.MSELoss()
 
-    spearman = 0
+        optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=0)
+        model.cuda()
 
-    for epoch in range(epochs):
-        running_loss = 0.0
-        optimizer = exp_lr_scheduler(optimizer, epoch)
-        list_noise = list(range(noise_num1))
-        np.random.shuffle(list_noise)
-        print('############# TID 2013 train phase epoch %2d ###############' % epoch)
-        count = 0
-        for index in list_noise:
-            if count % task_num == 0:
-                name_to_param = dict(temp_model.named_parameters())
-                for name, param in meta_model.named_parameters():
-                    diff = param.data - name_to_param[name].data
-                    name_to_param[name].data.add_(diff)
+        spearman = 0
+        for epoch in range(epochs):
+            optimizer = exp_lr_scheduler(optimizer, epoch)
 
-            name_to_param = dict(model.named_parameters())
-            for name, param in temp_model.named_parameters():
-                diff = param.data - name_to_param[name].data
-                name_to_param[name].data.add_(diff)
+            if epoch == 0:
+                dataloader_valid = load_data('train')
+                model.eval()
 
-            dataloader_train, dataloader_valid = load_data('train', 'tid2013', index)
-            if dataloader_train == 0:
-                continue
+                sp = computeSpearman(dataloader_valid, model)[0]
+                if sp > spearman:
+                    spearman = sp
+                print('no train srocc {:4f}'.format(sp))
 
-            dataiter = iter(enumerate(dataloader_valid))
-            model.train()
-
-            for batch_idx, data in enumerate(tqdm(dataloader_train)):
-                inputs = data['image']
-                batch_size = inputs.size()[0]
-                labels = data['rating'].view(batch_size, -1)
-
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                loss.backward()
-                optimizer.step()
-
-                idx, data_val = next(dataiter)
-                if idx >= len(dataloader_valid) - 1:
-                    dataiter = iter(enumerate(dataloader_valid))
-                inputs_val = data_val['image']
-                batch_size1 = inputs_val.size()[0]
-                labels_val = data_val['rating'].view(batch_size1, -1)
-
-                optimizer.zero_grad()
-                outputs_val = model(inputs_val)
-                loss_val = criterion(outputs_val, labels_val)
-                loss_val.backward()
-                optimizer.step()
-
-                try:
-                    running_loss += loss_val.item()
-                except:
-                    print('unexpected error, could not calculate loss or do a sum.')
-
-                name_to_param1 = dict(meta_model.named_parameters())
-                name_to_param2 = dict(temp_model.named_parameters())
-                for name, param in model.named_parameters():
-                    diff = param.data - name_to_param2[name].data
-                    name_to_param1[name].data.add_(diff / task_num)
-                count += 1
-        epoch_loss = running_loss / count
-        print('current loss = ', epoch_loss)
-
-        running_loss = 0.0
-        list_noise = list(range(noise_num2))
-        np.random.shuffle(list_noise)
-        print('############# Kadid train phase epoch %2d ###############' % epoch)
-        count = 0
-        for index in list_noise:
-            if count % task_num == 0:
-                name_to_param = dict(temp_model.named_parameters())
-                for name, param in meta_model.named_parameters():
-                    diff = param.data - name_to_param[name].data
-                    name_to_param[name].data.add_(diff)
-
-            name_to_param = dict(model.named_parameters())
-            for name, param in temp_model.named_parameters():
-                diff = param.data - name_to_param[name].data
-                name_to_param[name].data.add_(diff)
-
-            dataloader_train, dataloader_valid = load_data('train', 'kadid10k', index)
-            if dataloader_train == 0:
-                continue
-            dataiter = iter(enumerate(dataloader_valid))
-            model.train()
-
+            # print('############# train phase epoch %2d ###############' % epoch)
+            dataloader_train = load_data('train')
+            model.train()  # Set model to training mode
             for batch_idx, data in enumerate(tqdm(dataloader_train)):
                 inputs = data['image']
                 batch_size = inputs.size()[0]
@@ -681,52 +607,25 @@ def train_model():
                 loss.backward()
                 optimizer.step()
 
-                idx, data_val = next(dataiter)
-                if idx >= len(dataloader_valid) - 1:
-                    dataiter = iter(enumerate(dataloader_valid))
-                inputs_val = data_val['image']
-                batch_size1 = inputs_val.size()[0]
-                labels_val = data_val['rating'].view(batch_size1, -1)
-                if use_gpu:
-                    try:
-                        inputs_val, labels_val = Variable(inputs_val.float().cuda()), Variable(
-                            labels_val.float().cuda())
-                    except:
-                        print(inputs_val, labels_val)
-                else:
-                    inputs_val, labels_val = Variable(inputs_val), Variable(labels_val)
+            # print('############# test phase epoch %2d ###############' % epoch)
+            dataloader_valid = load_data('test')
+            model.eval()
 
-                optimizer.zero_grad()
-                outputs_val = model(inputs_val)
-                loss_val = criterion(outputs_val, labels_val)
-                loss_val.backward()
-                optimizer.step()
+            sp, pl = computeSpearman(dataloader_valid, model)
+            if sp > spearman:
+                spearman = sp
+                plcc = pl
+            if sp > best_srocc:
+                best_srocc = sp
+                print('=====Prior model saved===Srocc:%f========' % best_srocc)
+                best_model = copy.deepcopy(model)
+                torch.save(best_model.cuda(), 'models/prior.pt')
 
-                try:
-                    running_loss += loss_val.item()
-                except:
-                    print('unexpected error, could not calculate loss or do a sum.')
+            print('Validation Results - Epoch: {:2d}, PLCC: {:4f}, SROCC: {:4f}, '
+                  'best SROCC: {:4f}'.format(epoch, pl, sp, spearman))
 
-                name_to_param = dict(meta_model.named_parameters())
-                for name, param in model.named_parameters():
-                    diff = param.data - name_to_param[name].data
-                    name_to_param[name].data.add_(diff / task_num)
+        srocc_l.append(spearman)
 
-                count += 1
-        epoch_loss = running_loss / count
-        print('current loss = ', epoch_loss)
-
-        print('############# test phase epoch %2d ###############' % epoch)
-        dataloader_train, dataloader_valid = load_data('test', 0)
-        model.eval()
-        model.cuda()
-        sp = computeSpearman(dataloader_valid, model)[0]
-        if sp > spearman:
-            spearman = sp
-        print('new srocc {:4f}, best srocc {:4f}'.format(sp, spearman))
-
-    torch.save(model.cuda().state_dict(),
-               './models/mgliqa.pt')
 
 def exp_lr_scheduler(optimizer, epoch, lr_decay_epoch=10):
 
@@ -746,77 +645,41 @@ def my_collate(batch):
     return default_collate(batch)
 
 
-def normalization(data):
+def load_data(mod='train'):
 
-    range = np.max(data) - np.min(data)
-    return (data - np.min(data)) / range
+    meta_num = 50
+    data_dir = os.path.join('LIVE_WILD/')
+    traincsv_name = "train_image" + ".csv"
+    testcsv_name = "test_image" + ".csv"
+    train_path = os.path.join(data_dir, traincsv_name)
+    test_path = os.path.join(data_dir, testcsv_name)
 
+    output_size = (384, 384)
+    transformed_dataset_train = ImageRatingsDataset(csv_file=train_path,
+                                                    root_dir='path/to/LIVE_WILD/images/',
+                                                    transform=transforms.Compose([Rescale(output_size=(408, 408)),
+                                                                                  RandomHorizontalFlip(0.5),
+                                                                                  RandomCrop(
+                                                                                      output_size=output_size),
+                                                                                  Normalize(),
+                                                                                  ToTensor(),
+                                                                                  ]))
+    transformed_dataset_valid = ImageRatingsDataset(csv_file=test_path,
+                                                    root_dir='path/to/LIVE_WILD/images/',
+                                                    transform=transforms.Compose([Rescale(output_size=(384, 384)),
+                                                                                  Normalize(),
+                                                                                  ToTensor(),
+                                                                                  ]))
+    bsize = meta_num
 
-def load_data(mod='train', dataset='tid2013', worker_idx=0):
-
-    if dataset == 'tid2013':
-        data_dir = os.path.join('path/to/tid2013')
-        worker_original = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_per_noise.csv'), sep=',')
-        scores = worker_original['dmos']
-        normalized_scores = normalization(scores)
-        worker_original['dmos'] = normalized_scores
-        image_path = 'path/to/tid2013/distorted_images/'
-    else:
-        data_dir = os.path.join('path/to/kadid10k')
-        worker_original = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_per_noise.csv'), sep=',')
-        scores = worker_original['dmos']
-        normalized_scores = normalization(scores)
-        worker_original['dmos'] = normalized_scores
-        image_path = 'path/to/kadid10k/images/'
-    workers_fold = "noise/"
-    if not os.path.exists(workers_fold):
-        os.makedirs(workers_fold)
-
-    worker = worker_original['noise'].unique()[worker_idx]
-    print("----worker number: %2d---- %s" % (worker_idx, worker))
     if mod == 'train':
-        percent = 0.8
-        images = worker_original[worker_original['noise'].isin([worker])][['image', 'dmos']]
-
-        train_dataframe, valid_dataframe = train_test_split(images, train_size=percent)
-        train_path = workers_fold + "train_scores_" + str(worker) + ".csv"
-        test_path = workers_fold + "test_scores_" + str(worker) + ".csv"
-        train_dataframe.to_csv(train_path, sep=',', index=False)
-        valid_dataframe.to_csv(test_path, sep=',', index=False)
-
-        output_size = (384, 384)
-        transformed_dataset_train = ImageRatingsDataset(csv_file=train_path,
-                                                        root_dir=image_path,
-                                                        transform=transforms.Compose([Rescale(output_size=(408, 408)),
-                                                                                      RandomHorizontalFlip(0.5),
-                                                                                      RandomCrop(
-                                                                                          output_size=output_size),
-                                                                                      Normalize(),
-                                                                                      ToTensor(),
-                                                                                      ]))
-        transformed_dataset_valid = ImageRatingsDataset(csv_file=test_path,
-                                                        root_dir=image_path,
-                                                        transform=transforms.Compose([Rescale(output_size=(384, 384)),
-                                                                                      Normalize(),
-                                                                                      ToTensor(),
-                                                                                      ]))
-        dataloader_train = DataLoader(transformed_dataset_train, batch_size=20,
-                                      shuffle=True, num_workers=4, collate_fn=my_collate)
-        dataloader_valid = DataLoader(transformed_dataset_valid, batch_size=20,
-                                      shuffle=False, num_workers=4, collate_fn=my_collate)
+        dataloader = DataLoader(transformed_dataset_train, batch_size=10,
+                                shuffle=True, num_workers=4, collate_fn=my_collate)
     else:
-        cross_data_path = 'path/to/LIVE_WILD/image_labeled_by_score.csv'
-        transformed_dataset_valid_1 = ImageRatingsDataset(csv_file=cross_data_path,
-                                                          root_dir='path/to/LIVE_WILD/images',
-                                                          transform=transforms.Compose([Rescale(output_size=(384, 384)),
-                                                                                        Normalize(),
-                                                                                        ToTensor(),
-                                                                                        ]))
-        dataloader_train = 0
-        dataloader_valid = DataLoader(transformed_dataset_valid_1, batch_size=20,
-                                      shuffle=False, num_workers=4, collate_fn=my_collate)
+        dataloader = DataLoader(transformed_dataset_valid, batch_size=10,
+                                shuffle=False, num_workers=4, collate_fn=my_collate)
 
-    return dataloader_train, dataloader_valid
+    return dataloader
 
 
-train_model()
+finetune_model()
