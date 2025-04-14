@@ -5,10 +5,8 @@ from torch import nn
 import pandas as pd
 from skimage import transform
 import numpy as np
-import torch.nn.functional as F
 import torch.hub
 from functools import partial
-import cv2 as cv
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from timm.models.registry import register_model
 from timm.models.vision_transformer import _cfg, Mlp, Block
@@ -18,15 +16,11 @@ from torch.utils.data.dataloader import default_collate
 from torchvision import transforms
 from tqdm import tqdm
 from PIL import Image
-import time
-import math
 import copy
 from sklearn.model_selection import train_test_split
 import torch.optim as optim
-from torchvision import models
 import warnings
 import random
-import timm
 
 warnings.filterwarnings("ignore")
 use_gpu = True
@@ -482,16 +476,49 @@ def crossvit_18_dagger_384(pretrained=False, **kwargs):
     return model
 
 
-class Net(nn.Module):
-    def __init__(self, net2, net):
-        super(Net, self).__init__()
-        self.net2 = net2
-        self.net = net
+class CSAB(nn.Module):
+    def __init__(self, in_channels, reduction_ratio=16, kernel_size=7):
+        super(CSAB, self).__init__()
+        self.channel_attention = ChannelAttention(in_channels, reduction_ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
 
     def forward(self, x):
+        out = x * self.channel_attention(x)
+        out = out * self.spatial_attention(out)
+        return out
+
+class Net(nn.Module):
+    def __init__(self , net1, net2, net):
+        super(Net, self).__init__()
+        self.net1 = net1
+        self.net2 = net2
+        self.net = net
+        self.conv1 = nn.Conv2d(in_channels=32,out_channels=56,kernel_size=3,stride=2,padding=1)
+        self.conv2 = nn.Conv2d(in_channels=56,out_channels=160,kernel_size=3,stride=2,padding=1)
+        self.conv3 = nn.Conv2d(in_channels=160,out_channels=1792,kernel_size=3,stride=2,padding=1)
+        self.CBAM = CSAB(in_channels=1792)
+
+    def forward(self, x):
+        # x1 = self.net1(x1)
+        eff_group = self.net1.extract_endpoints(x)
+        a2 = eff_group['reduction_2']#[1, 32, 56, 56]
+        a3 = eff_group['reduction_3']#[1, 56, 28, 28]
+        a4 = eff_group['reduction_4']#[1, 160, 14, 14]
+        a6 = eff_group['reduction_6']#[1, 1792, 7, 7]
+
+        a2 = self.conv1(a2)
+        a3 = a3 + a2
+        a3 = self.conv2(a3)
+        a4 = a4 + a3
+        a4 = self.conv3(a4)
+        a6 = a6 + a4
+        a6 = self.CBAM(a6)
+        a6 = a6.mean(dim=[2, 3])
         x2 = self.net2(x)
-        x = self.net(x2)
+        x12 = torch.cat((a6,x2), 1)
+        x = self.net(x12)
         return x
+
 
 
 def computeSpearman(dataloader_valid, model):
@@ -530,9 +557,10 @@ def train_model():
     noise_num1 = 24
     noise_num2 = 25
 
+    net1 = EfficientNet.from_name('efficientnet-b4')
     net2 = crossvit_18_dagger_384(pretrained=True)
-    net = BaselineModel1(1, 0.5, 3000)
-    model = Net(net2=net2, net=net)
+    net = BaselineModel1(1, 0.5, 4792)
+    model = Net(net1=net1,net2=net2,net=net)
     criterion = nn.MSELoss()
     ignored_params = list(map(id, model.net.parameters()))
     base_params = filter(lambda p: id(p) not in ignored_params,
@@ -698,8 +726,7 @@ def train_model():
         print('new srocc {:4f}, best srocc {:4f}'.format(sp, spearman))
 
     torch.save(model.cuda().state_dict(),
-               'MGLIQA/model_IQA/final.pt')
-
+               './models/mgliqa.pt')
 
 def exp_lr_scheduler(optimizer, epoch, lr_decay_epoch=10):
 
@@ -728,19 +755,19 @@ def normalization(data):
 def load_data(mod='train', dataset='tid2013', worker_idx=0):
 
     if dataset == 'tid2013':
-        data_dir = os.path.join('MGLIQA/tid2013')
+        data_dir = os.path.join('path/to/tid2013')
         worker_original = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_per_noise.csv'), sep=',')
         scores = worker_original['dmos']
         normalized_scores = normalization(scores)
         worker_original['dmos'] = normalized_scores
-        image_path = 'MGLIQA/tid2013/distorted_images/'
+        image_path = 'path/to/tid2013/distorted_images/'
     else:
-        data_dir = os.path.join('MGLIQA/kadid10k')
+        data_dir = os.path.join('path/to/kadid10k')
         worker_original = pd.read_csv(os.path.join(data_dir, 'image_labeled_by_per_noise.csv'), sep=',')
         scores = worker_original['dmos']
         normalized_scores = normalization(scores)
         worker_original['dmos'] = normalized_scores
-        image_path = 'MGLIQA/kadid10k/images/'
+        image_path = 'path/to/kadid10k/images/'
     workers_fold = "noise/"
     if not os.path.exists(workers_fold):
         os.makedirs(workers_fold)
@@ -778,9 +805,9 @@ def load_data(mod='train', dataset='tid2013', worker_idx=0):
         dataloader_valid = DataLoader(transformed_dataset_valid, batch_size=20,
                                       shuffle=False, num_workers=4, collate_fn=my_collate)
     else:
-        cross_data_path = 'MGLIQA/LIVE_WILD/image_labeled_by_score.csv'
+        cross_data_path = 'path/to/LIVE_WILD/image_labeled_by_score.csv'
         transformed_dataset_valid_1 = ImageRatingsDataset(csv_file=cross_data_path,
-                                                          root_dir='MGLIQA/LIVE_WILD/images',
+                                                          root_dir='path/to/LIVE_WILD/images',
                                                           transform=transforms.Compose([Rescale(output_size=(384, 384)),
                                                                                         Normalize(),
                                                                                         ToTensor(),
