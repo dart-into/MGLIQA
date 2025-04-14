@@ -16,13 +16,14 @@
 ### 1. Meta-training
 *Modify dataset path*
 
-'''bash
+ ```bash
 python MGLIQA_meta_training.py
-'''
+ ```
+
 ### 2. Finetune
-'''bash
+ ```bash
 python MGLIQA_finetune.py
-'''
+ ```
 ---
 ## Code
 - [X] Meta-Training
